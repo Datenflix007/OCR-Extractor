@@ -1,2 +1,4 @@
 #Folder for virtual environment
 venv/
+
+output/
