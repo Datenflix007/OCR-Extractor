@@ -2,6 +2,8 @@
 import os
 import io
 import re
+import time
+import uuid
 import zipfile
 import shutil
 import tempfile
@@ -9,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
-from flask import Flask, request, send_file, jsonify, render_template
+from flask import Flask, request, send_file, jsonify, render_template, Response, stream_with_context
 
 from PIL import Image
 import pytesseract
@@ -36,6 +38,39 @@ except Exception:
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
+# --- Fortschritt / ETA --------------------------------------------------------
+
+# Sehr einfache globale Fortschrittsverfolgung pro Job
+PROGRESS: Dict[str, Dict[str, float]] = {}
+# Struktur:
+# PROGRESS[job_id] = {
+#   "total": int, "done": int, "start": epoch_seconds, "eta": float, "message": str
+# }
+
+def _progress_init(job_id: str, total: int, message: str = "Starte…"):
+    PROGRESS[job_id] = {"total": total, "done": 0, "start": time.time(), "eta": 0.0, "message": message}
+
+def _progress_step(job_id: str, inc: int = 1, message: Optional[str] = None):
+    p = PROGRESS.get(job_id)
+    if not p:
+        return
+    p["done"] = min(p["total"], p.get("done", 0) + inc)
+    # ETA aus gleitendem Durchschnitt
+    elapsed = max(0.001, time.time() - p["start"])
+    avg_per = elapsed / max(1, p["done"])
+    remaining = max(0, p["total"] - p["done"])
+    p["eta"] = remaining * avg_per
+    if message is not None:
+        p["message"] = message
+
+def _progress_finish(job_id: str, message: str = "Fertig."):
+    p = PROGRESS.get(job_id)
+    if not p:
+        return
+    p["done"] = p["total"]
+    p["eta"] = 0.0
+    p["message"] = message
+
 # --- Utility -----------------------------------------------------------------
 
 GERMAN_STOPWORDS = {
@@ -50,6 +85,13 @@ GERMAN_STOPWORDS = {
 TITLES = {"Kaiser","König","Herzog","Markgraf","Graf","Bischof","Abt","Papst","Landgraf","Prinz","Fürst"}
 PLACE_HINTS = {"Stadt","Dorf","Kloster","Bistum","Burg","Mark","Gau","Grafschaft"}
 
+# ► Erweiterbare Liste spezieller Schlagwörter (regex, case-insensitive, Wortgrenzen)
+SPECIAL_KEYWORDS = [
+    r"Bier", r"Brauerei(?:en)?", r"Stadtrat", r"Domkapitel", r"Pfarrer", r"Gericht(?:e|s)?",
+    # Ergänzbar, z.B.:
+    r"Schöffen(?:stuhl)?", r"Zoll", r"Markt", r"Wein", r"Mühle", r"Hospital", r"Abgabe(?:n)?"
+]
+
 def secure_folder_name(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name).strip().replace(" ", "_")
     return s or f"werk_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -62,16 +104,13 @@ def tesseract_lang(choice: str) -> str:
     try:
         available = set(pytesseract.get_languages(config=""))
     except Exception:
-        # Falls Auflistung scheitert, nimm konservative Defaults
         available = {"deu"}
 
     if choice == "frak":
-        # Die üblichen Kandidaten; nimm den ersten, der vorhanden ist.
         for cand in ("deu_frak", "Fraktur", "frk", "deu"):
             if cand in available:
                 return cand
         return "deu"
-    # normale deutsche Antiqua
     return "deu" if "deu" in available else (sorted(available)[0])
 
 def pdf_to_images(pdf_bytes: bytes) -> List[Image.Image]:
@@ -111,9 +150,10 @@ def pdf_to_images(pdf_bytes: bytes) -> List[Image.Image]:
         ) from e
 
 def ocr_image(img: Image.Image, lang: str) -> str:
-    # leichte Vorverarbeitung
+    # leichte Vorverarbeitung + stabile Tesseract-Config für Fließtext
     gray = img.convert("L")
-    text = pytesseract.image_to_string(gray, lang=lang)
+    config = "--oem 1 --psm 6"
+    text = pytesseract.image_to_string(gray, lang=lang, config=config)
     return text
 
 def split_annals_by_year(full_text: str) -> Dict[str, str]:
@@ -165,13 +205,13 @@ def make_zip_of_folder(folder: Path) -> bytes:
 
 def detect_entities(text: str) -> Dict[str, Dict[str, List[str]]]:
     """
-    Liefert ein Dict mit Schlüsseln 'personen', 'orte', 'worte', jeweils -> {ent: [fundstellen...]}
-
-    Fundstellen sind hier nur Text-Snippets; die eigentliche Verortung (Jahr, Datei) passiert später.
+    Liefert ein Dict mit Schlüsseln 'personen', 'orte', 'worte', 'schlagworte'
+    jeweils -> {ent: [fundstellen...]} (Fundstellen = kurze Snippets).
     """
     persons: Dict[str, List[str]] = {}
     places: Dict[str, List[str]] = {}
     words: Dict[str, List[str]] = {}
+    specials: Dict[str, List[str]] = {}
 
     if _SPACY_NLP:
         doc = _SPACY_NLP(text)
@@ -180,30 +220,32 @@ def detect_entities(text: str) -> Dict[str, Dict[str, List[str]]]:
                 persons.setdefault(ent.text, []).append(ent.sent.text.strip())
             elif ent.label_ in ("LOC","GPE"):
                 places.setdefault(ent.text, []).append(ent.sent.text.strip())
-        # Als Wörter: alle Nomen ohne Stopwörter (grob)
         for token in doc:
             if token.pos_ in ("NOUN", "PROPN"):
                 t = token.text.strip()
                 if t and t.lower() not in GERMAN_STOPWORDS and not t[0].isdigit():
                     words.setdefault(t, []).append(token.sent.text.strip())
     else:
-        # Heuristiken ohne spaCy:
-        # Personen: "Titel + Name" / zwei aufeinanderfolgende Eigennamen
         for m in re.finditer(r"\b(" + "|".join(TITLES) + r")\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+von\s+[A-ZÄÖÜ][a-zäöüß]+)?", text):
             persons.setdefault(m.group(0), []).append(get_sentence(text, m.start()))
-        # Orte: nach Präpositionen oder mit Hinweiswörtern
         for m in re.finditer(r"\b(?:zu|in|bei|nach|aus|von)\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+)", text):
             places.setdefault(m.group(1), []).append(get_sentence(text, m.start()))
         for hint in PLACE_HINTS:
             for m in re.finditer(rf"\b{hint}\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+)", text):
                 places.setdefault(m.group(1), []).append(get_sentence(text, m.start()))
-        # Wörter: kapitalisierte Nomen (sehr grob, wegen Deutsch sparsam filtern)
         for m in re.finditer(r"\b([A-ZÄÖÜ][a-zäöüß]{3,})\b", text):
             token = m.group(1)
             if token.lower() not in GERMAN_STOPWORDS and token not in persons and token not in places:
                 words.setdefault(token, []).append(get_sentence(text, m.start()))
 
-    return {"personen": persons, "orte": places, "worte": words}
+    # Spezielle Schlagworte (case-insensitive, Wortgrenzen)
+    for pattern in SPECIAL_KEYWORDS:
+        rx = re.compile(rf"\b{pattern}\b", flags=re.IGNORECASE)
+        for m in rx.finditer(text):
+            kw = m.group(0)  # wie im Text gefunden
+            specials.setdefault(kw, []).append(get_sentence(text, m.start()))
+
+    return {"personen": persons, "orte": places, "worte": words, "schlagworte": specials}
 
 def get_sentence(text: str, idx: int, window: int=180) -> str:
     start = max(0, text.rfind('.', 0, idx) + 1)
@@ -212,41 +254,56 @@ def get_sentence(text: str, idx: int, window: int=180) -> str:
         end = min(len(text), idx + window)
     return text[start:end].strip()
 
-def annotate_text_with_links(text: str, base_rel_to_register: str, entities: Dict[str, Dict[str, List[str]]]) -> Tuple[str, Dict[str, Dict[str, List[str]]]]:
+def annotate_text_with_links(
+    text: str,
+    base_rel_to_register: str,
+    entities: Dict[str, Dict[str, List[str]]]
+) -> Tuple[str, Dict[str, Dict[str, List[str]]]]:
     """
     Ersetzt Vorkommen im Text durch Markdown-Links zu Registerdateien.
-    Gibt (annotierter_text, verwendete_entities) zurück, damit wir nur die tatsächlich verlinkten anlegen.
+    Gibt (annotierter_text, verwendete_entities) zurück.
     """
-    used = {"personen": {}, "orte": {}, "worte": {}}
+    used = {"personen": {}, "orte": {}, "worte": {}, "schlagworte": {}}
 
-    # Reihenfolge: längere zuerst, damit es weniger Überschneidungen gibt
     def sorted_keys(d):
         return sorted(d.keys(), key=lambda s: (-len(s), s.lower()))
 
+    # Reihenfolge: erst Spezial-Schlagwörter (case-insensitive),
+    # dann Personen/Orte/Worte (case-sensitive, um Eigennamen zu schonen)
+    for ent in sorted_keys(entities.get("schlagworte", {})):
+        slug = slugify(ent)
+        link = f"[{ent}]({base_rel_to_register}/schlagworte/{slug}.md)"
+        pattern = re.compile(rf"\b{re.escape(ent)}\b", flags=re.IGNORECASE)
+        if pattern.search(text):
+            text = pattern.sub(link, text)
+            used["schlagworte"].setdefault(ent, entities["schlagworte"][ent])
+
     for kind in ("personen","orte","worte"):
-        for ent in sorted_keys(entities[kind]):
+        for ent in sorted_keys(entities.get(kind, {})):
             slug = slugify(ent)
             link = f"[{ent}]({base_rel_to_register}/{kind}/{slug}.md)"
-            # Worte: nur “ganze Wörter” ersetzen, Personen/Orte ebenso
             pattern = re.compile(rf"\b{re.escape(ent)}\b")
             if pattern.search(text):
                 text = pattern.sub(link, text)
                 used[kind].setdefault(ent, entities[kind][ent])
+
     return text, used
 
-def update_register_files(work_dir: Path, used_entities: Dict[str, Dict[str, List[str]]], mention_info: Tuple[str, str, str]) -> None:
+def update_register_files(
+    work_dir: Path,
+    used_entities: Dict[str, Dict[str, List[str]]],
+    mention_info: Tuple[str, str, str]
+) -> None:
     """
     Legt/aktualisiert die Registerdateien.
     mention_info = (kind_context, relative_link_from_register, year_or_label)
-      kind_context z.B. "jahre/1272/README.md"
-      relative_link_from_register z.B. "../jahre/1272/README.md"
-      year_or_label z.B. "1272" oder "Haupttext"
     """
     register_root = work_dir / "register"
     index_files = {
-        "personen": register_root / "personen" / "README.md",
-        "orte":     register_root / "orte" / "README.md",
-        "worte":    register_root / "worte" / "README.md",
+        "personen":   register_root / "personen" / "README.md",
+        "orte":       register_root / "orte" / "README.md",
+        "worte":      register_root / "worte" / "README.md",
+        "schlagworte":register_root / "schlagworte" / "README.md",
     }
     for kind, idx_path in index_files.items():
         ensure_dir(idx_path.parent)
@@ -255,22 +312,19 @@ def update_register_files(work_dir: Path, used_entities: Dict[str, Dict[str, Lis
 
     kind_context, rel_link, label = mention_info
 
-    for kind in ("personen","orte","worte"):
-        for ent, snippets in used_entities[kind].items():
+    for kind in ("personen","orte","worte","schlagworte"):
+        for ent, snippets in used_entities.get(kind, {}).items():
             slug = slugify(ent)
             entry_file = register_root / kind / f"{slug}.md"
             if not entry_file.exists():
                 write_file(entry_file, f"# {ent}\n\n**Ersterwähnung:** {label}\n\n## Vorkommen\n")
-            # neuen Vorkommenspunkt anhängen
             existing = entry_file.read_text(encoding="utf-8")
-            # Vermerk mit Link zurück
             bullet = f"- {label}: [{kind_context}]({rel_link})"
             if snippets:
                 bullet += f" – {snippets[0][:140].strip()}..."
             if bullet not in existing:
                 write_file(entry_file, existing.rstrip() + "\n" + bullet + "\n")
 
-            # Im Index verlinken
             idx_p = index_files[kind]
             idx = idx_p.read_text(encoding="utf-8")
             rel = f"./{slug}.md"
@@ -284,26 +338,23 @@ def update_register_files(work_dir: Path, used_entities: Dict[str, Dict[str, Lis
 def index():
     return render_template("index.html")
 
-@app.route("/api/ocr", methods=["POST"])
-def api_ocr():
-    """
-    Erwartet Multipart:
-      - file: Bild oder PDF
-      - script: 'deu' | 'frak'
-      - doc_type: 'annals' | 'other'
-      - work_name: Ordnername
-    """
-    if "file" not in request.files:
-        return jsonify({"ok": False, "error": "Bitte eine Datei hochladen."}), 400
+@app.route("/api/progress", methods=["GET"])
+def api_progress():
+    job_id = request.args.get("job") or "default"
+    p = PROGRESS.get(job_id)
+    if not p:
+        return jsonify({"ok": True, "percent": 0, "done": 0, "total": 0, "eta_seconds": 0, "message": "Warte auf Start…"})
+    percent = 0 if p["total"] == 0 else int(100 * p["done"] / max(1, p["total"]))
+    return jsonify({
+        "ok": True,
+        "percent": percent,
+        "done": int(p["done"]),
+        "total": int(p["total"]),
+        "eta_seconds": round(p["eta"], 1),
+        "message": p.get("message", "")
+    })
 
-    f = request.files["file"]
-    if not f.filename:
-        return jsonify({"ok": False, "error": "Leere Datei."}), 400
-
-    script = request.form.get("script", "deu")
-    doc_type = request.form.get("doc_type", "other")
-    work_name = secure_folder_name(request.form.get("work_name", ""))
-
+def _run_ocr_pipeline(raw_bytes: bytes, filename: str, script: str, doc_type: str, work_name: str, job_id: str):
     # Basis-Ausgabeordner
     out_root = Path("output")
     work_dir = out_root / work_name
@@ -311,28 +362,31 @@ def api_ocr():
         shutil.rmtree(work_dir)
     ensure_dir(work_dir)
 
-    raw_bytes = f.read()
+    # PDF / Bild lesen
     pages: List[Image.Image] = []
     try:
-        if f.filename.lower().endswith(".pdf"):
+        if filename.lower().endswith(".pdf"):
             pages = pdf_to_images(raw_bytes)
         else:
             pages = [Image.open(io.BytesIO(raw_bytes))]
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Lesefehler: {e}"}), 400
+        raise RuntimeError(f"Lesefehler: {e}")
+
+    _progress_init(job_id, total=len(pages), message="Seiten vorbereiten…")
 
     lang = tesseract_lang("frak" if script == "frak" else "deu")
     full_text_list = []
-    for img in pages:
-        try:
-            txt = ocr_image(img, lang=lang)
-            full_text_list.append(txt)
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"OCR-Fehler: {e}"}), 500
+    for i, img in enumerate(pages, 1):
+        t0 = time.time()
+        txt = ocr_image(img, lang=lang)
+        full_text_list.append(txt)
+        _progress_step(job_id, 1, message=f"OCR {i}/{len(pages)} (⌀/ETA wird berechnet)…")
+        # (kleiner Sleep 0,0x verhindert, dass Browser-Polling zu dicht ist)
+        time.sleep(0.01)
 
     full_text = "\n\n".join(full_text_list).strip()
     if not full_text:
-        return jsonify({"ok": False, "error": "OCR ergab keinen Text."}), 400
+        raise RuntimeError("OCR ergab keinen Text.")
 
     # Oberes README mit kurzer Info
     write_file(work_dir / "README.md",
@@ -341,11 +395,11 @@ def api_ocr():
     summary = {"created": [], "register": []}
 
     if doc_type == "other":
-        # gesamter Text in README.md
+        entities = detect_entities(full_text)
         annotated, used = annotate_text_with_links(
             full_text,
             base_rel_to_register="register",
-            entities=detect_entities(full_text)
+            entities=entities
         )
         write_file(work_dir / "README.md",
                    (work_dir / "README.md").read_text(encoding="utf-8") + "\n\n" + annotated + "\n")
@@ -356,14 +410,13 @@ def api_ocr():
         )
         summary["created"].append("README.md (voller Text)")
     else:
-        # Annalen → pro Jahr Unterordner + README.md
         year_map = split_annals_by_year(full_text)
         if not year_map:
-            # Fallback: wenn keine Jahre erkannt → alles in README.md wie „other“
+            entities = detect_entities(full_text)
             annotated, used = annotate_text_with_links(
                 full_text,
                 base_rel_to_register="register",
-                entities=detect_entities(full_text)
+                entities=entities
             )
             write_file(work_dir / "README.md",
                        (work_dir / "README.md").read_text(encoding="utf-8") + "\n\n" + annotated + "\n")
@@ -377,23 +430,26 @@ def api_ocr():
             years_root = work_dir / "jahre"
             ensure_dir(years_root)
 
-            for y, text in year_map.items():
-                year_dir = years_root / y
-                ensure_dir(year_dir)
-                # Verlinkungen setzen (Register liegt zwei Ebenen höher)
+            items = list(year_map.items())
+            # Fortschritt neu kalibrieren: OCR war 100%, jetzt wir zählen weiter für Jahresverarbeitung
+            PROGRESS[job_id]["total"] = PROGRESS[job_id]["done"] + len(items)
+            for idx, (y, text) in enumerate(items, 1):
+                entities = detect_entities(text)
                 annotated, used = annotate_text_with_links(
                     text,
                     base_rel_to_register="../../register",
-                    entities=detect_entities(text)
+                    entities=entities
                 )
+                year_dir = years_root / y
+                ensure_dir(year_dir)
                 write_file(year_dir / "README.md", f"# {y}\n\n{annotated}\n")
-                # Register aktualisieren: Link von Register → zurück zu jahre/<y>/README.md
                 update_register_files(
                     work_dir,
                     used,
                     mention_info=(f"jahre/{y}/README.md", f"../jahre/{y}/README.md", y)
                 )
                 summary["created"].append(f"jahre/{y}/README.md")
+                _progress_step(job_id, 1, message=f"Schreibe Jahresordner {idx}/{len(items)}…")
 
     # Ergebnis bündeln als ZIP zum Download
     zip_bytes = make_zip_of_folder(work_dir)
@@ -401,8 +457,56 @@ def api_ocr():
     zip_path = Path(tempfile.gettempdir()) / zip_name
     zip_path.write_bytes(zip_bytes)
 
-    summary["zip"] = f"/download/{zip_name}"
-    return jsonify({"ok": True, "summary": summary})
+    _progress_finish(job_id, message="Fertig.")
+    return {"zip": f"/download/{zip_name}", "created": summary["created"]}
+
+@app.route("/api/ocr", methods=["POST"])
+def api_ocr():
+    """
+    Erwartet Multipart:
+      - file: Bild oder PDF
+      - script: 'deu' | 'frak'
+      - doc_type: 'annals' | 'other'
+      - work_name: Ordnername
+    Optional: ?stream=1 für SSE-Progress.
+    """
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "Bitte eine Datei hochladen."}), 400
+
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"ok": False, "error": "Leere Datei."}), 400
+
+    script = request.form.get("script", "deu")
+    doc_type = request.form.get("doc_type", "other")
+    work_name = secure_folder_name(request.form.get("work_name", ""))
+
+    job_id = request.form.get("job") or str(uuid.uuid4())
+
+    raw_bytes = f.read()
+    filename = f.filename
+
+    # Streaming (SSE): verarbeitet synchron, sendet aber Fortschritt live
+    if request.args.get("stream") == "1":
+        @stream_with_context
+        def generate():
+            yield f"event: start\ndata: {job_id}\n\n"
+            try:
+                result = _run_ocr_pipeline(raw_bytes, filename, script, doc_type, work_name, job_id)
+                yield f"event: done\ndata: {result['zip']}\n\n"
+            except Exception as e:
+                err = str(e).replace("\n", " ")
+                yield f"event: error\ndata: {err}\n\n"
+        return Response(generate(), mimetype="text/event-stream")
+
+    # Normale (nicht-streamende) Antwort – Fortschritt kann parallel via /api/progress polled werden
+    try:
+        _progress_init(job_id, total=1, message="Initialisiere…")
+        result = _run_ocr_pipeline(raw_bytes, filename, script, doc_type, work_name, job_id)
+        return jsonify({"ok": True, "job": job_id, "summary": {"created": result["created"], "zip": result["zip"]}})
+    except Exception as e:
+        _progress_finish(job_id, message="Fehler.")
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 @app.route("/download/<zipname>", methods=["GET"])
 def download(zipname):
@@ -415,7 +519,6 @@ def download(zipname):
 
 if __name__ == "__main__":
     # Optional: expliziten Tesseract-Pfad aus Umgebungsvariable verwenden
-    # (nur nötig, wenn tesseract nicht im PATH ist)
     if os.environ.get("TESSERACT_CMD"):
         pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
 
