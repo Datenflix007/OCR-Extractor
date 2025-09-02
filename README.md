@@ -34,6 +34,7 @@ System: Tesseract muss installiert sein inkl. Sprachpakete deu und Fraktur (oft 
 
 
 ## Dependencies:
+- Python must be installed on your device
 - [Tesseract must be installed on the devide](https://github.com/UB-Mannheim/tesseract/wiki?utm_source=chatgpt.com)
 ## Weiterführende Ideen:
 - Aus dem Ortsregister eine OSM Kartenanwendung schaffen
