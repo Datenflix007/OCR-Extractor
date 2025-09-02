@@ -63,3 +63,14 @@ C:\Tools\poppler\Library\bin\pdftoppm.exe
 Öffne PowerShell (als Benutzer, reicht):
 
 setx POPPLER_PATH "C:\Tools\poppler\Library\bin"
+
+
+
+
+
+````
+ $env:POPPLER_PATH = "C:\Tools\poppler\Library\bin"
+ $env:Path += ";C:\Tools\poppler\Library\bin"
+ where pdfinfo
+ pdfinfo -v
+````
