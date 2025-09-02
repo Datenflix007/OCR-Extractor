@@ -38,3 +38,28 @@ System: Tesseract muss installiert sein inkl. Sprachpakete deu und Fraktur (oft 
 - [Tesseract must be installed on the devide](https://github.com/UB-Mannheim/tesseract/wiki?utm_source=chatgpt.com)
 ## Weiterführende Ideen:
 - Aus dem Ortsregister eine OSM Kartenanwendung schaffen
+
+
+1. Poppler herunterladen
+
+Gehe auf die Seite mit den Windows-Builds, z. B.:
+👉 https://github.com/oschwartz10612/poppler-windows/releases/
+
+Lade das neueste poppler-xx.x.0-x64.zip (oder -x86.zip falls du nur 32-bit hast) herunter.
+
+2. Entpacken
+
+Entpacke das ZIP nach einem festen Ort, z. B.:
+
+C:\Tools\poppler
+
+
+Dort liegt dann u. a.:
+
+C:\Tools\poppler\Library\bin\pdfinfo.exe
+C:\Tools\poppler\Library\bin\pdftoppm.exe
+
+
+Öffne PowerShell (als Benutzer, reicht):
+
+setx POPPLER_PATH "C:\Tools\poppler\Library\bin"
