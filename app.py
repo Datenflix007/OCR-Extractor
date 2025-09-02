@@ -57,33 +57,58 @@ def secure_folder_name(name: str) -> str:
 def tesseract_lang(choice: str) -> str:
     """
     choice: 'deu' (Antiqua) oder 'frak' (Fraktur)
-    Wir versuchen mehrere Varianten, damit es plattformübergreifend klappt.
+    Wählt einen tatsächlich verfügbaren Sprachcode.
     """
+    try:
+        available = set(pytesseract.get_languages(config=""))
+    except Exception:
+        # Falls Auflistung scheitert, nimm konservative Defaults
+        available = {"deu"}
+
     if choice == "frak":
-        # Reihenfolge der Versuche
-        for lang in ("deu_frak", "Fraktur", "frk", "deu"):
-            try:
-                pytesseract.get_tesseract_version()
-                return lang
-            except Exception:
-                pass
+        # Die üblichen Kandidaten; nimm den ersten, der vorhanden ist.
+        for cand in ("deu_frak", "Fraktur", "frk", "deu"):
+            if cand in available:
+                return cand
         return "deu"
-    return "deu"
+    # normale deutsche Antiqua
+    return "deu" if "deu" in available else (sorted(available)[0])
 
 def pdf_to_images(pdf_bytes: bytes) -> List[Image.Image]:
+    """
+    Versucht zuerst pdf2image (+ Poppler). Wenn Poppler fehlt oder scheitert,
+    fällt auf PyMuPDF zurück – falls installiert.
+    Optional: POPPLER_PATH Umgebungsvariable verwenden.
+    """
+    # 1) pdf2image versuchen
     if _IMAGES_FROM_PDF_BACKEND == "pdf2image":
-        return convert_from_bytes(pdf_bytes, dpi=300)
-    elif _IMAGES_FROM_PDF_BACKEND == "pymupdf":
-        import fitz
+        try:
+            from pdf2image import convert_from_bytes
+            import os as _os
+            poppler_path = _os.environ.get("POPPLER_PATH")  # z. B. C:\Tools\poppler\Library\bin
+            kwargs = {"dpi": 300}
+            if poppler_path:
+                kwargs["poppler_path"] = poppler_path
+            return convert_from_bytes(pdf_bytes, **kwargs)
+        except Exception as e:
+            print("pdf2image fehlgeschlagen:", e)
+
+    # 2) PyMuPDF als Fallback
+    try:
+        import fitz  # PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         pages = []
         for page in doc:
             pix = page.get_pixmap(dpi=300)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            import io as _io
+            img = Image.open(_io.BytesIO(pix.tobytes("png")))
             pages.append(img)
         return pages
-    else:
-        raise RuntimeError("Kein PDF-zu-Image Backend verfügbar. Installiere 'pdf2image' (mit Poppler) oder 'PyMuPDF'.")
+    except Exception as e:
+        raise RuntimeError(
+            "Kein funktionierender PDF-Reader gefunden. "
+            "Installiere Poppler (und setze PATH oder POPPLER_PATH) oder 'pip install pymupdf'."
+        ) from e
 
 def ocr_image(img: Image.Image, lang: str) -> str:
     # leichte Vorverarbeitung
@@ -195,7 +220,7 @@ def annotate_text_with_links(text: str, base_rel_to_register: str, entities: Dic
     used = {"personen": {}, "orte": {}, "worte": {}}
 
     # Reihenfolge: längere zuerst, damit es weniger Überschneidungen gibt
-    def sorted_keys(d): 
+    def sorted_keys(d):
         return sorted(d.keys(), key=lambda s: (-len(s), s.lower()))
 
     for kind in ("personen","orte","worte"):
@@ -389,5 +414,10 @@ def download(zipname):
 # ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Optional: expliziten Tesseract-Pfad aus Umgebungsvariable verwenden
+    # (nur nötig, wenn tesseract nicht im PATH ist)
+    if os.environ.get("TESSERACT_CMD"):
+        pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
+
     os.makedirs("output", exist_ok=True)
     app.run(host="0.0.0.0", port=8000, debug=True)
