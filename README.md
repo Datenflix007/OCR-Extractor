@@ -1,5 +1,13 @@
 # OCR-Extractor
 
+## Über den OCR-Extractor
+- soll etwa Annalen, oder alte Schriften extahieren
+- pro Werk soll ein ordner in ``output/[Ordername]`` angelegt werden
+    - bei Annalen soll pro Jahreseintrag ein Unterordner für das Jahr erstellt werden und in die README.md geschrieben werden
+
+
+
+
 ## Ideensammlung:
 - Bilder oder PDFs hochlädt
 - OCR in deutscher Antiqua oder Fraktur ausführt

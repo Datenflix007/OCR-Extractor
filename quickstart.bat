@@ -1,25 +1,30 @@
-# run.ps1
-# Batch-Skript zum Starten des OCR-Extractors
+@echo off
+setlocal
 
-# Prüfen, ob venv-Ordner existiert
-if (!(Test-Path -Path ".\venv")) {
-    Write-Host "⚙️  Erstelle neues virtuelles Environment..."
+REM Prüfen, ob venv-Ordner existiert
+if not exist "venv\" (
+    echo ⚙️  Erstelle neues virtuelles Environment...
     python -m venv venv
-}
 
-# Aktivieren des venv
-Write-Host "✅ Aktiviere venv..."
-. .\venv\Scripts\Activate.ps1
+    REM venv aktivieren
+    call venv\Scripts\activate.bat
 
-# Pakete installieren (nur wenn requirements.txt existiert)
-if (Test-Path -Path ".\requirements.txt") {
-    Write-Host "📦 Installiere Dependencies..."
-    pip install --upgrade pip
-    pip install -r requirements.txt
-} else {
-    Write-Host "⚠️  Keine requirements.txt gefunden, überspringe Installation."
-}
+    REM Dependencies installieren, falls requirements.txt vorhanden
+    if exist requirements.txt (
+        echo 📦 Installiere Dependencies...
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    ) else (
+        echo ⚠️  Keine requirements.txt gefunden, ueberspringe Installation.
+    )
+) else (
+    REM venv aktivieren
+    call venv\Scripts\activate.bat
+)
 
-# Server starten
-Write-Host "🚀 Starte OCR-Extractor..."
+REM Server starten
+echo 🚀 Starte OCR-Extractor...
 python app.py
+
+endlocal
+pause
