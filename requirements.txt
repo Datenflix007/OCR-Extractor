@@ -2,6 +2,7 @@ flask
 pytesseract
 pillow
 pdf2image
+PyMuPDF
 # alternativ statt pdf2image:
 # PyMuPDF
 # optional für bessere NER:
