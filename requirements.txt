@@ -1,0 +1,9 @@
+flask
+pytesseract
+pillow
+pdf2image
+# alternativ statt pdf2image:
+# PyMuPDF
+# optional für bessere NER:
+# spacy
+# de_core_news_sm  (per: python -m spacy download de_core_news_sm)

@@ -1,0 +1,180 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="de">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>OCR-Extractor</title>
+    <style>
+         :root {
+            --bg: #0b1020;
+            --card: #141a2f;
+            --text: #e7ecf5;
+            --muted: #9fb3d1;
+            --accent: #86b7ff;
+        }
+        
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu;
+            background: var(--bg);
+            color: var(--text);
+        }
+        
+        .wrap {
+            max-width: 900px;
+            margin: 32px auto;
+            padding: 0 16px;
+        }
+        
+        .card {
+            background: var(--card);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, .35);
+        }
+        
+        h1 {
+            margin: 0 0 16px;
+            font-size: 28px;
+        }
+        
+        label {
+            display: block;
+            margin: 14px 0 6px;
+            color: var(--muted);
+        }
+        
+        input[type="text"],
+        select,
+        .filebox {
+            width: 100%;
+            padding: 12px 14px;
+            border-radius: 12px;
+            border: 1px solid #2a3656;
+            background: #0f1530;
+            color: var(--text);
+        }
+        
+        .filebox {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            cursor: pointer;
+        }
+        
+        .row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        
+        button {
+            margin-top: 18px;
+            padding: 12px 16px;
+            border-radius: 12px;
+            border: none;
+            background: linear-gradient(135deg, #5aa2ff, #6af0ff);
+            color: #05122c;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        
+        .muted {
+            color: var(--muted);
+            font-size: 14px;
+        }
+        
+        .result {
+            white-space: pre-wrap;
+            background: #0f1530;
+            border: 1px solid #2a3656;
+            padding: 12px;
+            border-radius: 12px;
+            margin-top: 14px;
+        }
+        
+        a {
+            color: var(--accent);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="wrap">
+        <div class="card">
+            <h1>OCR-Extractor</h1>
+            <p class="muted">Lade ein Bild oder PDF hoch, wähle Schrift &amp; Dokumenttyp, gib einen Ordnernamen an – der Rest passiert automatisch.</p>
+
+            <form id="ocrForm">
+                <label>Datei (Bild oder PDF)</label>
+                <div class="filebox" onclick="document.getElementById('file').click()">
+                    <span id="fileLabel">Datei auswählen…</span>
+                    <input id="file" name="file" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,.pdf" style="display:none" required />
+                </div>
+
+                <div class="row">
+                    <div>
+                        <label>Schrift</label>
+                        <select name="script" id="script">
+              <option value="deu">Deutsche Antiqua</option>
+              <option value="frak">Fraktur</option>
+            </select>
+                    </div>
+                    <div>
+                        <label>Dokumenttyp</label>
+                        <select name="doc_type" id="doc_type">
+              <option value="annals">Annalen</option>
+              <option value="other">Andere Schrift</option>
+            </select>
+                    </div>
+                </div>
+
+                <label>Ordnername für das Werk</label>
+                <input type="text" id="work_name" name="work_name" placeholder="z. B. Braun_NaumburgerAnnalen" required />
+
+                <button type="submit">OCR starten</button>
+            </form>
+
+            <div id="status" class="result" style="display:none"></div>
+        </div>
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('file');
+        const fileLabel = document.getElementById('fileLabel');
+        fileInput.addEventListener('change', () => {
+            fileLabel.textContent = fileInput.files.length ? fileInput.files[0].name : "Datei auswählen…";
+        });
+
+        const statusBox = document.getElementById('status');
+        const form = document.getElementById('ocrForm');
+
+        form.addEventListener('submit', async(e) => {
+            e.preventDefault();
+            statusBox.style.display = 'block';
+            statusBox.textContent = 'Verarbeite…';
+
+            const fd = new FormData(form);
+            const res = await fetch('/api/ocr', {
+                method: 'POST',
+                body: fd
+            });
+            const data = await res.json();
+
+            if (!data.ok) {
+                statusBox.textContent = "Fehler: " + (data.error || "Unbekannter Fehler");
+                return;
+            }
+
+            const summary = data.summary || {};
+            let text = "Fertig!\n\nErzeugt:\n";
+            (summary.created || []).forEach(x => text += "  • " + x + "\n");
+            if (summary.zip) text += `\nDownload: ${location.origin}${summary.zip}\n`;
+            statusBox.textContent = text;
+        });
+    </script>
+</body>
+
+</html>
